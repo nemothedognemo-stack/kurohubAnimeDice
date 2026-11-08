@@ -16,7 +16,7 @@ local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local TweenService = game:GetService("TweenService")
 
-local DISCORD_URL = "https://discord.gg/qrXTGvKgmN"
+local DISCORD_URL = "https://discord.gg/ac31sxz"
 
 -- If the script runs more than once, only the newest run keeps its loops alive
 local RUN_ID = tostring(os.clock()) .. tostring(math.random(1, 1e9))
