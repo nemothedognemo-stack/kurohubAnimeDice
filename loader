@@ -1,0 +1,1613 @@
+--[[
+    Kuro Hub v1.0  |  blue edition
+    Rebuilt GUI (particles, navy/blue theme) â€” feature set carried over from previous build.
+    Auto execute: save this file as 'kurohub.lua' in your executor's workspace folder,
+    or fill SCRIPT_URL below.
+]]
+
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+
+local DISCORD_URL = "https://discord.gg/qrXTGvKgmN"
+
+-- If the script runs more than once, only the newest run keeps its loops alive
+local RUN_ID = tostring(os.clock()) .. tostring(math.random(1, 1e9))
+local env = (getgenv and getgenv()) or _G
+env.KuroRunId = RUN_ID
+env.KuroAutoPlacing = nil
+local function alive()
+	return env.KuroRunId == RUN_ID
+end
+
+local endpoints = ReplicatedStorage:WaitForChild("endpoints", 30)
+local c2s = endpoints and endpoints:WaitForChild("client_to_server", 30)
+
+local function invoke(name, ...)
+	local remote = c2s and c2s:FindFirstChild(name)
+	if remote then
+		local args = { ... }
+		pcall(function()
+			remote:InvokeServer(table.unpack(args))
+		end)
+	end
+end
+
+local function invokeRet(name, ...)
+	local remote = c2s and c2s:FindFirstChild(name)
+	if not remote then
+		return false
+	end
+	local args = { ... }
+	return pcall(function()
+		return remote:InvokeServer(table.unpack(args))
+	end)
+end
+
+local state = {
+	autoStart = false,
+	autoSkip = false,
+	autoReplay = false,
+	autoLeave = false,
+	autoCard = false,
+	randomCard = false,
+	autoJoinEvent = false,
+	autoJoinDailyChallenge = false,
+	dailyResetAt = 0,
+	dailyCompletedResetAt = 0,
+	dailyJoinPending = false,
+	dailyLockUntil = 0,
+	randomPlace = false,
+	placeRadius = "15",
+	unitIds = "",
+	transparent = false,
+	autoUpgrade = false,
+	autoScanUnits = false,
+	antiAfk = false,
+	minimizeKey = "RightShift",
+	incognitoMode = false,
+	autoExecTeleport = true,
+	cardOption = "2",
+	rgbEnabled = true,
+	themeColor = "",
+	fpsBoost = false,
+	farmingStats = { wins = 0, losses = 0, games = 0, gold = 0, gems = 0, xp = 0, seconds = 0 },
+}
+
+-- ===== Anti-AFK =====
+do
+	local okService, virtualUser = pcall(function()
+		return game:GetService("VirtualUser")
+	end)
+	local localPlayer = Players.LocalPlayer
+	if okService and virtualUser and localPlayer then
+		localPlayer.Idled:Connect(function()
+			if not alive() or not state.antiAfk then
+				return
+			end
+			local success, err = pcall(function()
+				virtualUser:CaptureController()
+				virtualUser:ClickButton2(Vector2.new(0, 0))
+			end)
+			if not success then
+				warn("[Kuro] Anti-AFK action failed: " .. tostring(err))
+			end
+		end)
+	else
+		warn("[Kuro] Anti-AFK VirtualUser unavailable")
+	end
+end
+
+-- ===== Settings saved to file (migrates from the old build's save) =====
+local SAVE_FILE = "kurohub_settings.json"
+local LEGACY_FILE = "nemohub_settings.json"
+
+local function saveSettings()
+	pcall(function()
+		local copy = {}
+		for k, v in pairs(state) do
+			copy[k] = v
+		end
+		writefile(SAVE_FILE, HttpService:JSONEncode(copy))
+	end)
+end
+
+local function loadSettings()
+	pcall(function()
+		local source
+		if isfile(SAVE_FILE) then
+			source = readfile(SAVE_FILE)
+		elseif isfile(LEGACY_FILE) then
+			source = readfile(LEGACY_FILE)
+			print("[Kuro] Migrated settings from " .. LEGACY_FILE)
+		end
+		if source then
+			local data = HttpService:JSONDecode(source)
+			for k, v in pairs(data) do
+				if state[k] ~= nil then
+					state[k] = v
+				end
+			end
+		end
+	end)
+end
+
+loadSettings()
+
+-- ===== Daily Challenge =====
+local dailyChallenge = {}
+do
+	local function now()
+		return os.time()
+	end
+	local function isLisbonDST(ts)
+		local d = os.date("!*t", ts)
+		local month, day, hour = d.month, d.day, d.hour
+		if month < 3 or month > 10 then return false end
+		if month > 3 and month < 10 then return true end
+		local on31 = os.date("!*t", ts + (31 - day) * 86400)
+		local lastSunday = 31 - (on31.wday - 1)
+		if month == 3 then
+			return day > lastSunday or (day == lastSunday and hour >= 1)
+		end
+		return day < lastSunday or (day == lastSunday and hour < 1)
+	end
+	local function nextResetAt(ts)
+		local offsetNow = isLisbonDST(ts) and 3600 or 0
+		local secondsIntoDay = (ts + offsetNow) % 86400
+		local estimate = ts + (86400 - secondsIntoDay)
+		local best
+		for delta = -3600, 3600, 3600 do
+			local candidate = estimate + delta
+			local offsetAtCandidate = isLisbonDST(candidate) and 3600 or 0
+			if candidate > ts and (candidate + offsetAtCandidate) % 86400 == 0 then
+				if not best or candidate < best then
+					best = candidate
+				end
+			end
+		end
+		return best or estimate
+	end
+	local function refreshReset()
+		local current = now()
+		local target = nextResetAt(current)
+		local oldTarget = tonumber(state.dailyResetAt) or 0
+		local oldLock = tonumber(state.dailyLockUntil) or 0
+		if oldLock > current then
+			if oldTarget > 0 and oldTarget <= current then
+				state.dailyLockUntil = 0
+				state.dailyCompletedResetAt = 0
+				state.dailyJoinPending = false
+			else
+				state.dailyLockUntil = target
+				state.dailyCompletedResetAt = target
+			end
+		elseif oldLock ~= 0 then
+			state.dailyLockUntil = 0
+			state.dailyCompletedResetAt = 0
+			state.dailyJoinPending = false
+		end
+		if oldTarget ~= target then
+			state.dailyResetAt = target
+			saveSettings()
+		end
+		return target
+	end
+	function dailyChallenge.remaining()
+		return math.max(0, refreshReset() - now())
+	end
+	function dailyChallenge.completed()
+		refreshReset()
+		return (tonumber(state.dailyLockUntil) or 0) > now()
+	end
+	function dailyChallenge.canJoin()
+		return not dailyChallenge.completed()
+	end
+	function dailyChallenge.markCompleted(reason)
+		local target = refreshReset()
+		state.dailyResetAt = target
+		state.dailyLockUntil = target
+		state.dailyCompletedResetAt = target
+		state.dailyJoinPending = false
+		saveSettings()
+		print("[Kuro] Daily Challenge COMPLETED (" .. tostring(reason) .. ")")
+	end
+	function dailyChallenge.markFinished()
+		if state.dailyJoinPending then
+			dailyChallenge.markCompleted("game_finished")
+		end
+	end
+	function dailyChallenge.requested()
+		state.dailyJoinPending = true
+		saveSettings()
+	end
+	local serverEvents = endpoints and endpoints:FindFirstChild("server_to_client")
+	task.spawn(function()
+		if not serverEvents then return end
+		local ev = serverEvents:WaitForChild("daily_challenge_remaining_time_changed", 30)
+		if ev and ev:IsA("RemoteEvent") then
+			ev.OnClientEvent:Connect(function(seconds)
+				if not alive() then return end
+				local serverRemaining = tonumber(seconds)
+				if serverRemaining and math.abs(serverRemaining - dailyChallenge.remaining()) > 180 then
+					warn("[Kuro] Daily server countdown differs from 00:00 Lisbon reset by over 3 minutes: " .. tostring(serverRemaining))
+				end
+			end)
+		end
+	end)
+	task.spawn(function()
+		if not serverEvents then return end
+		local ev = serverEvents:WaitForChild("game_finished", 30)
+		if ev and ev:IsA("RemoteEvent") then
+			ev.OnClientEvent:Connect(function()
+				if alive() then
+					dailyChallenge.markFinished()
+				end
+			end)
+		end
+	end)
+	refreshReset()
+end
+
+-- Started by a queued teleport (auto execute)?
+local fromQueue = env.KuroFromQueue and true or false
+if fromQueue then
+	env.KuroFromQueue = nil
+	if not state.autoExecTeleport then
+		return
+	end
+end
+
+-- ===== Auto execute on teleport / server change =====
+local SCRIPT_BUILD = "KuroHub-V1.0"
+-- Teleport payload: re-execute the user's NemoHub script (not this GUI build)
+local AUTOEXEC_URL = "WIP...."
+local SCRIPT_URL = AUTOEXEC_URL
+local SCRIPT_FILE = "kurohub.lua"
+local SCRIPT_FILE_NAMES = {
+	"kurohub.lua",
+	"KuroHub.lua",
+	"kurohub.luau",
+	"kurohub.txt",
+	"kurohub.lua.txt",
+}
+
+local queueFn = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+
+local function readOwnFile()
+	if not (isfile and readfile) then return nil end
+	local firstOld
+	for _, name in ipairs(SCRIPT_FILE_NAMES) do
+		local okR, content = pcall(function()
+			if isfile(name) then
+				return readfile(name)
+			end
+		end)
+		if okR and type(content) == "string" and #content > 0 then
+			if content:find(SCRIPT_BUILD, 1, true) then
+				return content, name, true
+			end
+			firstOld = firstOld or { content, name }
+		end
+	end
+	if firstOld then
+		return firstOld[1], firstOld[2], false
+	end
+	return nil
+end
+
+if SCRIPT_URL == "" and not readOwnFile() then
+	warn("[Kuro] Auto execute needs SCRIPT_URL filled in or the file '" .. SCRIPT_FILE .. "' saved in your executor's workspace folder.")
+end
+
+local function buildQueuedCode()
+	return table.concat({
+		"repeat task.wait() until game:IsLoaded()",
+		"task.wait(5)",
+		('loadstring(game:HttpGet(%q))()'):format(AUTOEXEC_URL),
+	}, "\n")
+end
+
+local autoExecStatus
+if not queueFn then
+	autoExecStatus = "Auto execute: NOT supported by this executor."
+elseif SCRIPT_URL == "" and not readOwnFile() then
+	autoExecStatus = "Thanks for using this script! '" .. SCRIPT_FILE .. "'."
+else
+	local src, foundName, isCurrent = readOwnFile()
+	if src and not isCurrent then
+		autoExecStatus = "Auto execute: saved file is OLD."
+	else
+		autoExecStatus = "Auto execute: ready" .. (foundName and (" (" .. foundName .. ")") or " (URL)")
+	end
+end
+local execName = "unknown"
+pcall(function()
+	if identifyexecutor then
+		execName = tostring((identifyexecutor()))
+	end
+end)
+autoExecStatus = autoExecStatus .. " [" .. execName .. "]"
+print("[Kuro] " .. autoExecStatus)
+
+-- ===== Unit ID learning =====
+local learned = env.KuroLearned
+if not learned then
+	learned = { ids = {}, confirmed = {}, likely = {}, manual = {}, count = 0, positions = {} }
+	env.KuroLearned = learned
+end
+learned.ids = learned.ids or {}
+learned.confirmed = learned.confirmed or {}
+learned.likely = learned.likely or {}
+learned.manual = learned.manual or {}
+learned.positions = learned.positions or {}
+learned.count = learned.count or 0
+if learned.positionsPlaceId ~= game.PlaceId or learned.positionsJobId ~= game.JobId then
+	learned.positions = {}
+	learned.positionsPlaceId = game.PlaceId
+	learned.positionsJobId = game.JobId
+end
+
+local UUID_PATTERN = "^{%x+%-%x+%-%x+%-%x+%-%x+}$"
+local lastScan = 0
+
+local function addUnitId(id, confirmed, likely)
+	if type(id) ~= "string" or not id:match(UUID_PATTERN) then return false end
+	if confirmed then learned.confirmed[id] = true end
+	if likely then learned.likely[id] = true end
+	if not learned.ids[id] then
+		learned.ids[id] = true
+		learned.count = learned.count + 1
+		return true
+	end
+	return false
+end
+
+local function scanInstanceTree(root, likely)
+	if not root then return end
+	local n = 0
+	for _, inst in ipairs(root:GetDescendants()) do
+		n = n + 1
+		if n % 400 == 0 then
+			task.wait()
+			if not alive() then return end
+		end
+		addUnitId(inst.Name, false, likely)
+		if inst:IsA("StringValue") then addUnitId(inst.Value, false, likely) end
+		if inst:IsA("LuaSourceContainer") then
+			local okSrc, source = pcall(function() return inst.Source end)
+			if okSrc and type(source) == "string" and #source > 0 then
+				for id in source:gmatch("{%x+%-%x+%-%x+%-%x+%-%x+}") do addUnitId(id, false, likely) end
+			end
+		end
+		for _, v in pairs(inst:GetAttributes()) do addUnitId(v, false, likely) end
+	end
+end
+
+local scanning = false
+local function scanUnitIds(full)
+	if scanning then return 0 end
+	scanning = true
+	lastScan = os.clock()
+	local before = learned.count
+	pcall(function()
+		scanInstanceTree(Players.LocalPlayer, true)
+		if full ~= false then scanInstanceTree(ReplicatedStorage, false) end
+		local unitsFolder = workspace:FindFirstChild("_UNITS")
+		if unitsFolder then scanInstanceTree(unitsFolder, false) end
+		for _, inst in ipairs(workspace:GetChildren()) do
+			local name = inst.Name:lower()
+			if name:find("unit") or name:find("place") or name:find("tower") or name:find("base") or name:find("plot") then
+				scanInstanceTree(inst, false)
+			end
+		end
+	end)
+	scanning = false
+	return learned.count - before
+end
+
+local AUTO_SCAN_INTERVAL = 20
+local autoScanNextAt = 0
+local function requestAutoScan()
+	autoScanNextAt = 0
+end
+
+task.spawn(function()
+	while alive() do
+		if state.autoScanUnits and os.clock() >= autoScanNextAt then
+			autoScanNextAt = os.clock() + AUTO_SCAN_INTERVAL
+			local ok, count = pcall(scanUnitIds, false)
+			if ok and count > 0 then
+				print(("[Kuro] Auto Scan Units: found %d new ID(s)"):format(count))
+			elseif not ok then
+				warn("[Kuro] Auto Scan Units failed: " .. tostring(count))
+			end
+		end
+		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	task.wait(1)
+	if not alive() then return end
+	scanUnitIds(true)
+end)
+
+local clearQueueFn = clear_queue_on_teleport or clearqueueonteleport or (syn and syn.clear_queue_on_teleport)
+
+local function queueSelf()
+	if state.autoExecTeleport and type(queueFn) == "function" then
+		-- Once per run: toggle init + GUI callbacks would otherwise stack copies
+		if env.KuroQueuedRun == RUN_ID then return end
+		env.KuroQueuedRun = RUN_ID
+		local ok, err = pcall(queueFn, buildQueuedCode())
+		if not ok then
+			env.KuroQueuedRun = nil
+			warn("[Kuro] Could not queue teleport script: " .. tostring(err))
+		end
+	end
+end
+
+local function setAutoExecTeleport(v)
+	if v then
+		queueSelf()
+	elseif type(clearQueueFn) == "function" then
+		pcall(clearQueueFn)
+		env.KuroQueuedRun = nil
+	end
+end
+
+queueSelf()
+
+-- ===== Look / Theme (Kuro: deep navy + electric blue) =====
+local COLORS = {
+	Background = Color3.fromRGB(10, 14, 26),     -- deep navy
+	Sidebar = Color3.fromRGB(14, 20, 38),        -- darker navy sidebar
+	Panel = Color3.fromRGB(22, 31, 54),          -- raised panel
+	Card = Color3.fromRGB(17, 26, 47),           -- card surface (content grid)
+	Text = Color3.fromRGB(235, 242, 255),
+	SubText = Color3.fromRGB(140, 163, 199),
+	Accent = Color3.fromRGB(59, 130, 246),       -- electric blue
+	AccentLight = Color3.fromRGB(125, 211, 252), -- cyan highlight
+	ToggleOff = Color3.fromRGB(38, 50, 79),
+	Stroke = Color3.fromRGB(63, 92, 143),
+	Success = Color3.fromRGB(0, 255, 170),
+}
+
+local KURO_GRADIENT = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(59, 130, 246)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(125, 211, 252)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(129, 104, 247)),
+})
+
+local currentTheme = COLORS.Background
+
+local function b64decode(data)
+	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local lookup = {}
+	for i = 1, #chars do lookup[chars:sub(i, i)] = i - 1 end
+	data = data:gsub("[^%w%+/=]", "")
+	local out = {}
+	local buf, bits = 0, 0
+	for i = 1, #data do
+		local c = data:sub(i, i)
+		if c == "=" then break end
+		buf = buf * 64 + lookup[c]
+		bits = bits + 6
+		if bits >= 8 then
+			bits = bits - 8
+			local byte = math.floor(buf / 2 ^ bits)
+			out[#out + 1] = string.char(byte % 256)
+			buf = buf % 2 ^ bits
+		end
+	end
+	return table.concat(out)
+end
+
+-- Optional images: paste your own base64 JPG/PNG here (empty = text/vector fallback).
+local ICON_B64 = ""
+local BANNER_B64 = ""
+
+local function loadImageAsset(b64, fileName)
+	if b64 == "" or type(writefile) ~= "function" then return nil end
+	local getAsset = getcustomasset or getsynasset
+	if type(getAsset) ~= "function" then return nil end
+	local ok, asset = pcall(function()
+		writefile(fileName, b64decode(b64))
+		return getAsset(fileName)
+	end)
+	if ok then return asset end
+	return nil
+end
+
+local function loadIcon() return loadImageAsset(ICON_B64, "kurohub_icon.jpg") end
+
+if env.KuroGameCleanup then
+	pcall(env.KuroGameCleanup)
+	env.KuroGameCleanup = nil
+end
+pcall(function()
+	game:GetService("ContextActionService"):UnbindAction("KuroMiniGame")
+end)
+
+local parent = (gethui and gethui()) or Players.LocalPlayer:WaitForChild("PlayerGui")
+-- Clean up this build AND any previous-build leftovers
+for _, n in ipairs({ "KuroHub", "KuroGames", "KuroBlack", "KuroESP", "KuroFarmingStats", "Nemohub", "NemohubBlack", "NemohubESP", "NemohubFarmingStats" }) do
+	local old = parent:FindFirstChild(n)
+	if old then old:Destroy() end
+end
+-- WindUI leftovers: destroy any ScreenGui whose name mentions windui
+for _, obj in ipairs(parent:GetChildren()) do
+	if obj:IsA("ScreenGui") and obj.Name:lower():find("windui") then obj:Destroy() end
+end
+
+local blackGui = Instance.new("ScreenGui")
+blackGui.Name = "KuroBlack"
+blackGui.ResetOnSpawn = false
+blackGui.IgnoreGuiInset = true
+blackGui.DisplayOrder = 5
+blackGui.Parent = parent
+
+local black = Instance.new("Frame")
+black.Size = UDim2.fromScale(1, 1)
+black.BackgroundColor3 = Color3.new(0, 0, 0)
+black.BorderSizePixel = 0
+black.Visible = false
+black.Parent = blackGui
+
+-- Farming Stats dashboard
+local function initFarmingDashboard()
+	local stats = state.farmingStats
+	if type(stats) ~= "table" then stats = {} end
+	for _, key in ipairs({ "wins", "losses", "games", "gold", "gems", "xp", "seconds" }) do
+		stats[key] = tonumber(stats[key]) or 0
+	end
+	state.farmingStats = stats
+	local started = os.clock()
+	local lastFlush = started
+	local finished = false
+	local statsGui = Instance.new("ScreenGui")
+	statsGui.Name = "KuroFarmingStats"
+	statsGui.ResetOnSpawn = false
+	statsGui.IgnoreGuiInset = true
+	statsGui.DisplayOrder = 7
+	statsGui.Enabled = false
+	statsGui.Parent = parent
+
+	local disableFromStats
+	local panel = Instance.new("Frame")
+	panel.AnchorPoint = Vector2.new(0.5, 0.5)
+	panel.Position = UDim2.fromScale(0.5, 0.5)
+	panel.Size = UDim2.fromOffset(340, 295)
+	panel.BackgroundColor3 = COLORS.Panel
+	panel.BorderSizePixel = 0
+	panel.Parent = statsGui
+	Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 14)
+	local closeStats = Instance.new("TextButton")
+	closeStats.Name = "CloseStats"
+	closeStats.AnchorPoint = Vector2.new(1, 0)
+	closeStats.Position = UDim2.new(1, -8, 0, 7)
+	closeStats.Size = UDim2.fromOffset(28, 28)
+	closeStats.Text = "X"
+	closeStats.Font = Enum.Font.GothamBold
+	closeStats.TextSize = 14
+	closeStats.TextColor3 = COLORS.Text
+	closeStats.BackgroundColor3 = COLORS.ToggleOff
+	closeStats.BorderSizePixel = 0
+	closeStats.ZIndex = 12
+	closeStats.Parent = panel
+	Instance.new("UICorner", closeStats).CornerRadius = UDim.new(0, 7)
+	closeStats.MouseButton1Click:Connect(function()
+		if disableFromStats then disableFromStats() end
+	end)
+	local outline = Instance.new("UIStroke", panel)
+	outline.Color = COLORS.Accent
+	outline.Thickness = 2
+	outline.Transparency = 0.3
+	local layout = Instance.new("UIListLayout", panel)
+	layout.Padding = UDim.new(0, 9)
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	local pad = Instance.new("UIPadding", panel)
+	pad.PaddingTop = UDim.new(0, 18)
+	pad.PaddingLeft = UDim.new(0, 16)
+	pad.PaddingRight = UDim.new(0, 16)
+	local function label(text, order, size, color)
+		local line = Instance.new("TextLabel")
+		line.LayoutOrder = order
+		line.Size = UDim2.new(1, 0, 0, 25)
+		line.BackgroundTransparency = 1
+		line.Text = text
+		line.TextColor3 = color or COLORS.Text
+		line.Font = Enum.Font.GothamBold
+		line.TextSize = size or 16
+		line.TextXAlignment = Enum.TextXAlignment.Center
+		line.Parent = panel
+		return line
+	end
+	label("KURO HUB  |  FARMING STATS", 1, 19, COLORS.AccentLight)
+	local uptime = label("Farming time: 00:00:00", 2)
+	local games = label("Games: 0   |   Wins: 0   |   Losses: 0", 3)
+	local rewards = label("Gold: 0   |   Gems: 0", 4)
+	local experience = label("XP: 0", 5)
+	label("FPS Boost active - 3D rendering disabled", 6, 11, COLORS.SubText)
+	label("Use your minimize key to open Kuro Hub", 7, 11, COLORS.SubText)
+
+	local function elapsed() return math.max(0, math.floor(os.clock() - started)) end
+	local function display()
+		local secs = stats.seconds + elapsed()
+		uptime.Text = ("Farming time: %02d:%02d:%02d"):format(math.floor(secs / 3600), math.floor(secs / 60) % 60, secs % 60)
+		games.Text = ("Games: %d   |   Wins: %d   |   Losses: %d"):format(stats.games, stats.wins, stats.losses)
+		rewards.Text = ("Gold: %d   |   Gems: %d"):format(stats.gold, stats.gems)
+		experience.Text = ("XP: %d"):format(stats.xp)
+	end
+	local folder = endpoints and endpoints:FindFirstChild("server_to_client")
+	local finishedEvent = folder and folder:FindFirstChild("game_finished")
+	if finishedEvent and finishedEvent:IsA("RemoteEvent") then
+		finishedEvent.OnClientEvent:Connect(function(data)
+			if not alive() or finished then return end
+			if type(data) ~= "table" then return end
+			finished = true
+			stats.games = stats.games + 1
+			if data.victory == true then stats.wins = stats.wins + 1 else stats.losses = stats.losses + 1 end
+			stats.gold = stats.gold + (tonumber(data.gold_reward) or 0)
+			stats.gems = stats.gems + (tonumber(data.gem_reward) or 0)
+			stats.xp = stats.xp + (tonumber(data.xp_reward) or 0)
+			stats.seconds = stats.seconds + elapsed()
+			started = os.clock()
+			saveSettings()
+			display()
+		end)
+	end
+	task.spawn(function()
+		while alive() do
+			display()
+			if os.clock() - lastFlush >= 30 then
+				stats.seconds = stats.seconds + elapsed()
+				started = os.clock()
+				lastFlush = os.clock()
+				saveSettings()
+			end
+			task.wait(1)
+		end
+	end)
+
+	local lighting = game:GetService("Lighting")
+	local oldGraphics = {}
+	local applied = false
+	local function setLowGraphics(enabled)
+		if enabled == applied then return end
+		applied = enabled
+		if enabled then
+			local ok, shadows = pcall(function() return lighting.GlobalShadows end)
+			if ok then
+				oldGraphics.shadows = shadows
+				pcall(function() lighting.GlobalShadows = false end)
+			end
+			oldGraphics.effects = {}
+			for _, inst in ipairs(lighting:GetChildren()) do
+				if inst:IsA("PostEffect") then
+					local ok2, value = pcall(function() return inst.Enabled end)
+					if ok2 then
+						table.insert(oldGraphics.effects, { instance = inst, enabled = value })
+						pcall(function() inst.Enabled = false end)
+					end
+				end
+			end
+		else
+			if oldGraphics.shadows ~= nil then pcall(function() lighting.GlobalShadows = oldGraphics.shadows end) end
+			for _, item in ipairs(oldGraphics.effects or {}) do
+				if item.instance and item.instance.Parent then
+					pcall(function() item.instance.Enabled = item.enabled end)
+				end
+			end
+			oldGraphics = {}
+		end
+	end
+	local function applyBoost(enabled)
+		statsGui.Enabled = enabled
+		setLowGraphics(enabled)
+		black.Visible = enabled
+		local ok, err = pcall(function() RunService:Set3dRenderingEnabled(not enabled) end)
+		if not ok then warn("[Kuro] FPS Boost: " .. tostring(err)) end
+		if enabled then display() end
+	end
+	disableFromStats = function()
+		if type(env.KuroSetFpsBoostOff) == "function" then
+			env.KuroSetFpsBoostOff()
+		else
+			state.fpsBoost = false
+			applyBoost(false)
+			saveSettings()
+		end
+	end
+	return applyBoost
+end
+local setFpsBoost = initFarmingDashboard()
+
+-- ===== Shared helpers (still used by the mini-games window) =====
+local function corner(inst, r)
+	Instance.new("UICorner", inst).CornerRadius = UDim.new(0, r or 8)
+end
+
+local function makeDraggable(handle, target, onTap)
+	local dragging, moved, startMouse, startPos, dragInput
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			moved = false
+			dragInput = input
+			startMouse = input.Position
+			startPos = target.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		local isMove = input.UserInputType == Enum.UserInputType.MouseMovement or (input.UserInputType == Enum.UserInputType.Touch and input == dragInput)
+		if isMove then
+			local d = input.Position - startMouse
+			if d.Magnitude > 5 then moved = true end
+			if moved then
+				target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			end
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			dragging = false
+			if not moved and onTap then onTap() end
+		end
+	end)
+end
+
+-- Dedicated ScreenGui for the mini-games window (absolute positioning, separate from WindUI)
+local gui = Instance.new("ScreenGui")
+gui.Name = "KuroGames"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 10
+gui.Parent = parent
+
+-- ===== Player: ESP + Noclip =====
+local setEsp, setNoclip
+do
+	local LocalPlayer = Players.LocalPlayer
+	local ESP_COLOR = Color3.fromRGB(125, 211, 252) -- Kuro cyan
+
+	local espFolder = Instance.new("Folder")
+	espFolder.Name = "KuroESP"
+	espFolder.Parent = parent
+
+	local espEnabled = false
+	local espObjects = {}
+
+	local function removeEsp(plr)
+		local o = espObjects[plr]
+		if o then
+			pcall(function()
+				o.highlight:Destroy()
+				o.billboard:Destroy()
+			end)
+			espObjects[plr] = nil
+		end
+	end
+
+	local function applyEsp(plr)
+		if not espEnabled or plr == LocalPlayer then return end
+		local char = plr.Character
+		if not char then return end
+		local root = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
+		if not root or not espEnabled then return end
+		removeEsp(plr)
+
+		local hl = Instance.new("Highlight")
+		hl.Name = "KuroESPHighlight"
+		hl.Adornee = char
+		hl.FillColor = ESP_COLOR
+		hl.FillTransparency = 0.6
+		hl.OutlineColor = Color3.new(1, 1, 1)
+		hl.OutlineTransparency = 0
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Parent = espFolder
+
+		local bb = Instance.new("BillboardGui")
+		bb.Name = "KuroESPLabel"
+		bb.Adornee = root
+		bb.AlwaysOnTop = true
+		bb.Size = UDim2.fromOffset(140, 20)
+		bb.StudsOffset = Vector3.new(0, 3.5, 0)
+		bb.Parent = espFolder
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.fromScale(1, 1)
+		lbl.BackgroundTransparency = 1
+		lbl.Text = plr.Name
+		lbl.TextColor3 = ESP_COLOR
+		lbl.TextStrokeTransparency = 0.3
+		lbl.Font = Enum.Font.GothamBold
+		lbl.TextSize = 13
+		lbl.Parent = bb
+
+		espObjects[plr] = { highlight = hl, billboard = bb, label = lbl }
+	end
+
+	local function trackPlayer(plr)
+		if plr == LocalPlayer then return end
+		plr.CharacterAdded:Connect(function() task.spawn(applyEsp, plr) end)
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do trackPlayer(plr) end
+	Players.PlayerAdded:Connect(trackPlayer)
+	Players.PlayerRemoving:Connect(removeEsp)
+
+	setEsp = function(v)
+		espEnabled = v
+		if v then
+			for _, plr in ipairs(Players:GetPlayers()) do task.spawn(applyEsp, plr) end
+		else
+			for plr in pairs(espObjects) do removeEsp(plr) end
+		end
+	end
+
+	task.spawn(function()
+		while alive() do
+			task.wait(0.25)
+			if espEnabled then
+				local myChar = LocalPlayer.Character
+				local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+				for plr, o in pairs(espObjects) do
+					local char = plr.Character
+					local root = char and char:FindFirstChild("HumanoidRootPart")
+					if myRoot and root then
+						o.label.Text = plr.Name .. " [" .. math.floor((root.Position - myRoot.Position).Magnitude) .. "m]"
+					end
+				end
+			end
+		end
+	end)
+
+	local noclipConn = nil
+	local noclipParts = {}
+
+	setNoclip = function(v)
+		if v then
+			if noclipConn then return end
+			noclipConn = RunService.Stepped:Connect(function()
+				local char = LocalPlayer.Character
+				if not char then return end
+				for _, part in ipairs(char:GetDescendants()) do
+					if part:IsA("BasePart") and part.CanCollide then
+						noclipParts[part] = true
+						part.CanCollide = false
+					end
+				end
+			end)
+		else
+			if noclipConn then
+				noclipConn:Disconnect()
+				noclipConn = nil
+			end
+			for part in pairs(noclipParts) do
+				if part.Parent then part.CanCollide = true end
+			end
+			noclipParts = {}
+		end
+	end
+end
+
+-- ===== Mini Games window (kept custom; opened from the Player tab) =====
+local gameTitle, gameContent, gameBackBtn, gameCloseBtn
+local stopCurrentGame
+
+local gameWindow = Instance.new("Frame")
+gameWindow.Name = "KuroGamesWindow"
+gameWindow.Size = UDim2.fromOffset(360, 430)
+gameWindow.AnchorPoint = Vector2.new(0.5, 0.5)
+gameWindow.Position = UDim2.fromScale(0.5, 0.5)
+gameWindow.BackgroundColor3 = COLORS.Background
+gameWindow.BorderSizePixel = 0
+gameWindow.Visible = false
+gameWindow.ZIndex = 30
+gameWindow.Parent = gui
+corner(gameWindow, 14)
+local gameWinStroke = Instance.new("UIStroke")
+gameWinStroke.Color = COLORS.Accent
+gameWinStroke.Thickness = 2
+gameWinStroke.Transparency = 0.3
+gameWinStroke.Parent = gameWindow
+
+local gameHeader = Instance.new("Frame")
+gameHeader.Size = UDim2.new(1, 0, 0, 36)
+gameHeader.BackgroundColor3 = COLORS.Sidebar
+gameHeader.BorderSizePixel = 0
+gameHeader.ZIndex = 31
+gameHeader.Parent = gameWindow
+
+gameTitle = Instance.new("TextLabel")
+gameTitle.Size = UDim2.new(1, -100, 1, 0)
+gameTitle.Position = UDim2.fromOffset(12, 0)
+gameTitle.BackgroundTransparency = 1
+gameTitle.Text = "Mini Games"
+gameTitle.TextColor3 = COLORS.Text
+gameTitle.TextXAlignment = Enum.TextXAlignment.Left
+gameTitle.Font = Enum.Font.GothamBold
+gameTitle.TextSize = 16
+gameTitle.ZIndex = 32
+gameTitle.Parent = gameHeader
+
+gameBackBtn = Instance.new("TextButton")
+gameBackBtn.Size = UDim2.fromOffset(28, 26)
+gameBackBtn.Position = UDim2.new(1, -68, 0, 5)
+gameBackBtn.BackgroundColor3 = COLORS.ToggleOff
+gameBackBtn.Text = "<"
+gameBackBtn.TextColor3 = COLORS.Text
+gameBackBtn.Font = Enum.Font.GothamBold
+gameBackBtn.TextSize = 16
+gameBackBtn.BorderSizePixel = 0
+gameBackBtn.AutoButtonColor = false
+gameBackBtn.Visible = false
+gameBackBtn.ZIndex = 32
+gameBackBtn.Parent = gameHeader
+corner(gameBackBtn, 6)
+
+gameCloseBtn = Instance.new("TextButton")
+gameCloseBtn.Size = UDim2.fromOffset(28, 26)
+gameCloseBtn.Position = UDim2.new(1, -34, 0, 5)
+gameCloseBtn.BackgroundColor3 = COLORS.ToggleOff
+gameCloseBtn.Text = "X"
+gameCloseBtn.TextSize = 14
+gameCloseBtn.TextColor3 = COLORS.Text
+gameCloseBtn.Font = Enum.Font.GothamBold
+gameCloseBtn.BorderSizePixel = 0
+gameCloseBtn.AutoButtonColor = false
+gameCloseBtn.ZIndex = 32
+gameCloseBtn.Parent = gameHeader
+corner(gameCloseBtn, 6)
+
+gameContent = Instance.new("Frame")
+gameContent.Name = "Content"
+gameContent.Position = UDim2.fromOffset(0, 36)
+gameContent.Size = UDim2.new(1, 0, 1, -36)
+gameContent.BackgroundTransparency = 1
+gameContent.ClipsDescendants = true
+gameContent.ZIndex = 31
+gameContent.Parent = gameWindow
+
+makeDraggable(gameHeader, gameWindow)
+
+local function clearGameContent()
+	if stopCurrentGame then
+		local fn = stopCurrentGame
+		stopCurrentGame = nil
+		if env.KuroGameCleanup == fn then env.KuroGameCleanup = nil end
+		pcall(fn)
+	end
+	for _, child in ipairs(gameContent:GetChildren()) do child:Destroy() end
+end
+
+local function setGameCleanup(fn)
+	stopCurrentGame = fn
+	env.KuroGameCleanup = fn
+end
+
+local function gameLabel(parentObj, text, size, position, textSize, color, bold)
+	local l = Instance.new("TextLabel")
+	l.Size = size
+	l.Position = position
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextColor3 = color or COLORS.Text
+	l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+	l.TextSize = textSize or 13
+	l.TextWrapped = true
+	l.ZIndex = 32
+	l.Parent = parentObj
+	return l
+end
+
+local function gameButton(parentObj, text, size, position, color)
+	local b = Instance.new("TextButton")
+	b.Size = size
+	b.Position = position
+	b.BackgroundColor3 = color or COLORS.Panel
+	b.Text = text
+	b.TextColor3 = COLORS.Text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 13
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = false
+	b.ZIndex = 32
+	b.Parent = parentObj
+	corner(b, 8)
+	local st = Instance.new("UIStroke")
+	st.Color = COLORS.Stroke
+	st.Thickness = 1.5
+	st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	st.Parent = b
+	return b
+end
+
+local function showGameOver(parentObj, titleText, subtitleText, onRestart)
+	local overlay = Instance.new("Frame")
+	overlay.Size = UDim2.fromScale(1, 1)
+	overlay.BackgroundColor3 = Color3.new(0, 0, 0)
+	overlay.BackgroundTransparency = 0.35
+	overlay.BorderSizePixel = 0
+	overlay.ZIndex = 40
+	overlay.Parent = parentObj
+	corner(overlay, 8)
+
+	local t = gameLabel(overlay, titleText, UDim2.new(1, -20, 0, 30), UDim2.new(0, 10, 0.5, -55), 22, COLORS.Text, true)
+	t.ZIndex = 41
+	t.TextXAlignment = Enum.TextXAlignment.Center
+
+	local s = gameLabel(overlay, subtitleText, UDim2.new(1, -20, 0, 24), UDim2.new(0, 10, 0.5, -20), 14, COLORS.SubText, false)
+	s.ZIndex = 41
+	s.TextXAlignment = Enum.TextXAlignment.Center
+
+	local b = gameButton(overlay, "Play Again", UDim2.fromOffset(130, 34), UDim2.new(0.5, -65, 0.5, 15))
+	b.ZIndex = 41
+	b.MouseButton1Click:Connect(onRestart)
+	return overlay
+end
+
+local gameActionName = "KuroMiniGame"
+
+local function bindGameKeys(keys)
+	local cas = game:GetService("ContextActionService")
+	pcall(function()
+		cas:BindActionAtPriority(gameActionName, function() return Enum.ContextActionResult.Sink end, false, 3000, table.unpack(keys))
+	end)
+end
+
+local function unbindGameKeys()
+	pcall(function()
+		game:GetService("ContextActionService"):UnbindAction(gameActionName)
+	end)
+end
+
+local function keyDown(...)
+	for _, key in ipairs({ ... }) do
+		if UserInputService:IsKeyDown(key) then return true end
+	end
+	return false
+end
+
+-- NOTE: startSnake / startPong / startMemory / startTicTacToe bodies were omitted
+-- from the source. Paste them above openGameMenu (or ask for a rebuild) and swap
+-- the placeholder `start` entries.
+
+local function openGameMenu()
+	clearGameContent()
+	gameTitle.Text = "Mini Games"
+	gameBackBtn.Visible = false
+	gameWindow.Visible = true
+
+	local list = Instance.new("Frame")
+	list.Size = UDim2.new(1, -24, 1, -24)
+	list.Position = UDim2.fromOffset(12, 12)
+	list.BackgroundTransparency = 1
+	list.ZIndex = 32
+	list.Parent = gameContent
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, 0, 0, 24)
+	title.BackgroundTransparency = 1
+	title.Text = "Choose a game:"
+	title.TextColor3 = COLORS.SubText
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 13
+	title.LayoutOrder = 0
+	title.ZIndex = 32
+	title.Parent = list
+
+	local games = {
+		{ name = "Snake", desc = "Eat apples and don't hit the walls", start = function() print("[Kuro] Snake missing from this build - paste the original body") end },
+		{ name = "Pong", desc = "First to 5 points wins", start = function() print("[Kuro] Pong missing") end },
+		{ name = "Memory", desc = "Repeat the color sequence", start = function() print("[Kuro] Memory missing") end },
+		{ name = "Tic-Tac-Toe", desc = "You are X, beat the CPU", start = function() print("[Kuro] TicTacToe missing") end },
+	}
+
+	for i, g in ipairs(games) do
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, 0, 0, 42)
+		b.BackgroundColor3 = COLORS.Panel
+		b.Text = g.name .. "  -  " .. g.desc
+		b.TextColor3 = COLORS.Text
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 12
+		b.TextWrapped = true
+		b.BorderSizePixel = 0
+		b.AutoButtonColor = false
+		b.LayoutOrder = i
+		b.ZIndex = 33
+		b.Parent = list
+		corner(b, 8)
+		local st = Instance.new("UIStroke")
+		st.Color = COLORS.Stroke
+		st.Thickness = 1.5
+		st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		st.Parent = b
+		b.MouseButton1Click:Connect(function() g.start() end)
+	end
+end
+
+gameBackBtn.MouseButton1Click:Connect(openGameMenu)
+gameCloseBtn.MouseButton1Click:Connect(function()
+	clearGameContent()
+	gameWindow.Visible = false
+end)
+
+-- ===== WindUI interface =====
+do
+	local okWind, WindUI = pcall(function()
+		return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+	end)
+
+	if not okWind or type(WindUI) ~= "table" then
+		warn("[Kuro] WindUI failed to load: " .. tostring(WindUI) .. " (automation loops still run)")
+	else
+		pcall(function() WindUI:SetParent(parent) end)
+
+		local accentBlue = Color3.fromHex("3B82F6")
+		local accentCyan = Color3.fromHex("7DD3FC")
+
+		local function keyNameOf(name)
+			local stored = tostring(name or "RightShift")
+			return Enum.KeyCode[stored] and stored or "RightShift"
+		end
+
+		local Window = WindUI:CreateWindow({
+			Title = "Kuro Hub",
+			Icon = "moon",
+			Author = "Summer Event - Autofarm + more",
+			Folder = "KuroHub",
+			Size = UDim2.fromOffset(580, 440),
+			MinSize = Vector2.new(520, 380),
+			MaxSize = Vector2.new(760, 560),
+			Theme = "Dark",
+			Transparent = true,
+			Resizable = true,
+			SideBarWidth = 170,
+			HideSearchBar = true,
+			ScrollBarEnabled = false,
+			NewElements = true,
+			ToggleKey = Enum.KeyCode[keyNameOf(state.minimizeKey)],
+			User = { Enabled = true, Anonymous = true },
+			OpenButton = {
+				Title = "Open Kuro Hub",
+				Icon = "moon",
+				CornerRadius = UDim.new(1, 0),
+				StrokeThickness = 3,
+				Enabled = true,
+				Draggable = true,
+				OnlyMobile = false,
+				Color = ColorSequence.new(accentBlue, accentCyan),
+			},
+		})
+
+		pcall(function()
+			Window:Tag({ Title = "v1.0", Icon = "github", Color = Color3.fromHex("#101828"), Border = true })
+		end)
+
+		pcall(function()
+			WindUI:Notify({
+				Title = "Kuro Hub",
+				Content = autoExecStatus,
+				Duration = 5,
+				Icon = "moon",
+			})
+		end)
+
+		local function save()
+			saveSettings()
+		end
+
+		-- Main tab
+		local tabMain = Window:Tab({ Title = "Main", Icon = "house", IconColor = accentCyan })
+		local tabEvent = Window:Tab({ Title = "Event", Icon = "calendar", IconColor = accentCyan })
+		local tabPlayer = Window:Tab({ Title = "Player", Icon = "user", IconColor = accentCyan })
+		local tabSettings = Window:Tab({ Title = "Settings", Icon = "settings", IconColor = accentCyan })
+
+		-- == MAIN ==
+		local secAutofarm = tabMain:Section({ Title = "Autofarm", Icon = "leaf", Box = true, Opened = true })
+		secAutofarm:Toggle({ Title = "Auto Start", Value = state.autoStart, Callback = function(v) state.autoStart = v save() end })
+		secAutofarm:Toggle({ Title = "Auto Skip Wave", Value = state.autoSkip, Callback = function(v) state.autoSkip = v save() end })
+		secAutofarm:Toggle({ Title = "Auto Replay", Value = state.autoReplay, Callback = function(v) state.autoReplay = v save() end })
+		secAutofarm:Toggle({ Title = "Auto Leave (Lobby)", Value = state.autoLeave, Callback = function(v) state.autoLeave = v save() end })
+		secAutofarm:Toggle({ Title = "Auto Upgrade Units", Value = state.autoUpgrade, Callback = function(v) state.autoUpgrade = v save() end })
+
+		local secDaily = tabMain:Section({ Title = "Daily Challenge", Icon = "clock", Box = true, Opened = true })
+		secDaily:Toggle({ Title = "Auto Join Daily Challenge", Value = state.autoJoinDailyChallenge, Callback = function(v) state.autoJoinDailyChallenge = v save() end })
+		local dailyPara
+		dailyPara = secDaily:Paragraph({
+			Title = "Daily reset (Lisbon 00:00)",
+			Desc = "calculating...",
+			Buttons = {
+				{
+					Title = "Mark Daily Completed",
+					Icon = "check",
+					Callback = function()
+						dailyChallenge.markCompleted("manual")
+					end,
+				},
+			},
+		})
+		task.spawn(function()
+			while alive() do
+				local rem = dailyChallenge.remaining()
+				if rem and dailyPara and type(dailyPara.SetDesc) == "function" then
+					local h = math.floor(rem / 3600)
+					local m = math.floor(rem / 60) % 60
+					local sec = rem % 60
+					pcall(function()
+						dailyPara:SetDesc(("Reset in %02d:%02d:%02d | %s"):format(h, m, sec, dailyChallenge.completed() and "COMPLETED" or "AVAILABLE"))
+					end)
+				end
+				task.wait(1)
+			end
+		end)
+
+		local secPlace = tabMain:Section({ Title = "Placement", Icon = "map-pin", Box = true, Opened = true })
+		secPlace:Toggle({ Title = "Random Place Units", Value = state.randomPlace, Callback = function(v) state.randomPlace = v save() end })
+		secPlace:Input({
+			Title = "Place radius (studs)",
+			Type = "Input",
+			Value = state.placeRadius,
+			Placeholder = "15",
+			Callback = function(v)
+				local n = tonumber(tostring(v))
+				if not n or n < 0 then n = 15 end
+				state.placeRadius = tostring(n)
+				save()
+			end,
+		})
+		local placeStatusPara
+		placeStatusPara = secPlace:Paragraph({
+			Title = "Auto Place",
+			Desc = "Scanning unit IDs...",
+		})
+
+		-- == EVENT ==
+		local secMatch = tabEvent:Section({ Title = "Matchmaking", Icon = "crosshair", Box = true, Opened = true })
+		secMatch:Toggle({ Title = "Auto Join Event", Value = state.autoJoinEvent, Callback = function(v) state.autoJoinEvent = v save() end })
+
+		local secCards = tabEvent:Section({ Title = "Cards", Icon = "layers", Box = true, Opened = true })
+		local cardRandomToggle
+		secCards:Toggle({
+			Title = "Auto Select Card",
+			Value = state.autoCard,
+			Callback = function(v)
+				state.autoCard = v
+				if v and state.randomCard and cardRandomToggle then
+					cardRandomToggle:Set(false)
+				end
+				save()
+			end,
+		})
+		cardRandomToggle = secCards:Toggle({
+			Title = "Random Card (1-3)",
+			Value = state.randomCard,
+			Callback = function(v)
+				state.randomCard = v
+				save()
+			end,
+		})
+		secCards:Input({
+			Title = "Card option",
+			Type = "Input",
+			Value = state.cardOption,
+			Placeholder = "2",
+			Callback = function(v)
+				local t = tostring(v):gsub("%s+", "")
+				if t == "" then t = "2" end
+				state.cardOption = t
+				save()
+			end,
+		})
+
+		-- == PLAYER ==
+		local secVisuals = tabPlayer:Section({ Title = "Visuals", Icon = "eye", Box = true, Opened = true })
+		secVisuals:Toggle({ Title = "ESP", Value = false, Callback = function(v) setEsp(v) end })
+		secVisuals:Toggle({ Title = "Noclip", Value = false, Callback = function(v) setNoclip(v) end })
+
+		local secGames = tabPlayer:Section({ Title = "Mini Games", Icon = "gamepad-2", Box = true, Opened = true })
+		secGames:Button({
+			Title = "Open Mini Games",
+			Icon = "play",
+			Callback = function()
+				openGameMenu()
+			end,
+		})
+
+		-- == SETTINGS ==
+		local secPerf = tabSettings:Section({ Title = "Performance", Icon = "gauge", Box = true, Opened = true })
+		local fpsToggle
+		fpsToggle = secPerf:Toggle({
+			Title = "FPS BOOST",
+			Value = state.fpsBoost,
+			Callback = function(v)
+				state.fpsBoost = v
+				setFpsBoost(v)
+				save()
+			end,
+		})
+		if not (fromQueue and state.fpsBoost == true) then
+			pcall(function() RunService:Set3dRenderingEnabled(true) end)
+		end
+		if fromQueue and state.fpsBoost then
+			-- queued teleports resume straight into boost
+			setFpsBoost(true)
+		end
+		env.KuroSetFpsBoostOff = function()
+			state.fpsBoost = false
+			pcall(function() setFpsBoost(false) end)
+			pcall(function()
+				if fpsToggle and type(fpsToggle.Set) == "function" then fpsToggle:Set(false) end
+			end)
+			save()
+		end
+
+		secPerf:Toggle({
+			Title = "Auto Scan Units (20s)",
+			Value = state.autoScanUnits,
+			Callback = function(v)
+				state.autoScanUnits = v
+				if v then requestAutoScan() end
+				save()
+			end,
+		})
+		secPerf:Toggle({ Title = "Anti-AFK", Value = state.antiAfk, Callback = function(v) state.antiAfk = v save() end })
+
+		local secInterface = tabSettings:Section({ Title = "Interface", Icon = "panel-top", Box = true, Opened = true })
+		secInterface:Toggle({
+			Title = "Transparent Background",
+			Value = state.transparent,
+			Callback = function(v)
+				state.transparent = v
+				pcall(function() Window:SetBackgroundTransparency(v and 0.35 or 0) end)
+				save()
+			end,
+		})
+		secInterface:Toggle({ Title = "RGB Effects", Desc = "Reserved for WindUI theming", Value = state.rgbEnabled, Callback = function(v) state.rgbEnabled = v save() end })
+		secInterface:Toggle({ Title = "Incognito Mode", Value = state.incognitoMode, Callback = function(v) state.incognitoMode = v save() end })
+
+		local autoExecReady = false
+		secInterface:Toggle({
+			Title = "Auto Execute On Teleport",
+			Value = state.autoExecTeleport,
+			Callback = function(v)
+				state.autoExecTeleport = v
+				if autoExecReady then setAutoExecTeleport(v) end
+				save()
+			end,
+		})
+		autoExecReady = true
+
+		local secKey = tabSettings:Section({ Title = "Minimize Key", Icon = "keyboard", Box = true, Opened = true })
+		secKey:Keybind({
+			Title = "Toggle UI key",
+			Value = keyNameOf(state.minimizeKey),
+			Callback = function(v)
+				state.minimizeKey = keyNameOf(v)
+				pcall(function() Window:SetToggleKey(Enum.KeyCode[keyNameOf(v)]) end)
+				save()
+			end,
+		})
+
+		local secTheme = tabSettings:Section({ Title = "Theme", Icon = "palette", Box = true, Opened = true })
+		local themeNames, currentThemeName = {}, "Dark"
+		pcall(function()
+			themeNames = WindUI:GetThemes() or {}
+			currentThemeName = WindUI:GetCurrentTheme() or "Dark"
+		end)
+		if #themeNames > 0 then
+			secTheme:Dropdown({
+				Title = "WindUI theme",
+				Values = themeNames,
+				Value = currentThemeName,
+				Callback = function(v)
+					pcall(function() Window:SetTheme(v) end)
+					save()
+				end,
+			})
+		else
+			secTheme:Paragraph({ Title = "WindUI theme", Desc = "Defaults to Dark" })
+		end
+
+		local secSystem = tabSettings:Section({ Title = "System", Icon = "info", Box = true, Opened = true })
+		secSystem:Paragraph({
+			Title = "Kuro Hub v1.0",
+			Desc = autoExecStatus,
+		})
+		secSystem:Button({
+			Title = "Copy Discord Link",
+			Icon = "link",
+			Callback = function()
+				local clip = setclipboard or toclipboard or (syn and syn.write_clipboard)
+				local ok = clip and pcall(clip, DISCORD_URL)
+				pcall(function()
+					WindUI:Notify({
+						Title = "Discord",
+						Content = ok and "Copied to clipboard!" and ("discord.gg/qrXTGvKgmN") or "Not supported by this executor",
+						Duration = 4,
+						Icon = "link",
+					})
+				end)
+			end,
+		})
+		secSystem:Button({
+			Title = "Save Settings Now",
+			Icon = "save",
+			Callback = function()
+				save()
+				pcall(function()
+					WindUI:Notify({ Title = "Kuro Hub", Content = "Settings saved", Duration = 3, Icon = "check" })
+				end)
+			end,
+		})
+	end
+end
+-- ===== Anti-spam / Automation loops =====
+local matchEnding = false
+local startVoted = false
+local cardNextAt = 0
+local skipNextAt = 0
+local replayVoted = false
+local CARD_COOLDOWN = 30
+local SKIP_COOLDOWN = 15
+
+task.spawn(function()
+	while alive() do
+		if not state.autoStart then
+			startVoted = false
+		elseif not matchEnding and not startVoted then
+			startVoted = true
+			invoke("vote_start")
+		end
+		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	while alive() do
+		local opt
+		if state.randomCard then
+			opt = tostring(math.random(1, 3))
+		elseif state.autoCard then
+			opt = tostring(state.cardOption)
+		end
+		if not opt then
+			cardNextAt = 0
+		elseif not matchEnding and os.clock() >= cardNextAt then
+			cardNextAt = os.clock() + CARD_COOLDOWN
+			invoke("select_roguelike_option", opt)
+		end
+		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	while alive() do
+		if not state.autoSkip then
+			skipNextAt = 0
+		elseif not matchEnding and os.clock() >= skipNextAt then
+			skipNextAt = os.clock() + SKIP_COOLDOWN
+			invoke("vote_wave_skip")
+		end
+		task.wait(1)
+	end
+end)
+
+do
+	local s2cFolder = endpoints and endpoints:FindFirstChild("server_to_client")
+	local finishedRemote = s2cFolder and s2cFolder:FindFirstChild("game_finished")
+	if finishedRemote and finishedRemote:IsA("RemoteEvent") then
+		finishedRemote.OnClientEvent:Connect(function()
+			if alive() and state.autoReplay and not state.autoLeave and not replayVoted then
+				replayVoted = true
+				task.delay(2, function()
+					if alive() and state.autoReplay and not state.autoLeave then
+						invoke("set_game_finished_vote", "replay")
+					end
+				end)
+			end
+		end)
+	end
+end
+
+-- Auto Leave logic (omitted in the source you sent â€” paste the original body here)
+local function startAutoLeave()
+	local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui", 15)
+	if not playerGui then return end
+	-- [Kuro] Logic body omitted from the snippet â€” re-add the original implementation.
+end
+startAutoLeave()
+
+-- Unit automation (omitted in the source you sent â€” paste the original body here)
+local function startUnitAutomation()
+	-- [Kuro] Logic body omitted from the snippet â€” re-add the original implementation.
+end
+task.spawn(startUnitAutomation)
+
+-- Auto Join Event
+task.spawn(function()
+	local requested = false
+	local busy = false
+	local retryAt = 0
+	local lastInfo = 0
+	local attempts = 0
+	local wasEnabled = false
+
+	while alive() do
+		local enabled = state.autoJoinEvent and not (state.autoJoinDailyChallenge and dailyChallenge.canJoin())
+		if not enabled then
+			requested = false
+			busy = false
+			retryAt = 0
+			attempts = 0
+		elseif not wasEnabled then
+			requested = false
+			retryAt = 0
+			attempts = 0
+		end
+		wasEnabled = enabled
+
+		if enabled and not matchEnding and not requested and not busy and os.clock() >= retryAt and attempts < 3 then
+			requested = true
+			busy = true
+			attempts = attempts + 1
+
+			task.spawn(function()
+				local ep = ReplicatedStorage:FindFirstChild("endpoints")
+				local folder = ep and ep:FindFirstChild("client_to_server")
+				local remote = folder and folder:FindFirstChild("request_matchmaking")
+				local ok, reply = false, "request_matchmaking missing"
+				if remote and remote:IsA("RemoteFunction") then
+					ok, reply = pcall(function() return remote:InvokeServer("summer2_event") end)
+				end
+				if not alive() or not state.autoJoinEvent then return end
+				busy = false
+				if not ok or reply == false then
+					requested = false
+					retryAt = os.clock() + 20
+				end
+			end)
+		end
+		task.wait(1)
+	end
+end)
+
+-- Daily Challenge
+local function runDailyChallengeJoin()
+	local requested = false
+	while alive() do
+		if not state.autoJoinDailyChallenge then
+			requested = false
+		elseif not dailyChallenge.canJoin() then
+			requested = false
+		elseif not requested and not matchEnding then
+			requested = true
+			local ok, result = invokeRet("request_matchmaking", "__DAILY_CHALLENGE")
+			if not ok or result == false then
+				-- Failed
+			else
+				dailyChallenge.requested()
+			end
+		end
+		task.wait(1)
+	end
+end
+task.spawn(runDailyChallengeJoin)
